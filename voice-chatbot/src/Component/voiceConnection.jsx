@@ -89,7 +89,10 @@ export default function VoiceBot() {
         } else if (Date.now() - silenceStartRef.current > SILENCE_MS) {
           // End of utterance -> send one merged buffer
           const combined = mergeInt16(bufferRef.current);
-          socket.emit("voice_chunk", combined.buffer); // send raw ArrayBuffer
+          // socket.emit("voice_chunk", combined.buffer); // send raw ArrayBuffer
+          socket.emit("voice_chunk", new Uint8Array(combined.buffer));
+          socket.emit("end_voice");   // tell server to process
+
           // reset
           bufferRef.current = [];
           silenceStartRef.current = null;
@@ -114,7 +117,7 @@ export default function VoiceBot() {
       }
       const tracks = sourceRef.current?.mediaStream?.getTracks?.() || [];
       tracks.forEach((t) => t.stop());
-    } catch {}
+    } catch { }
     bufferRef.current = [];
     silenceStartRef.current = null;
     speakingRef.current = false;
