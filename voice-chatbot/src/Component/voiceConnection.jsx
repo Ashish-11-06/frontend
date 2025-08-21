@@ -19,6 +19,8 @@ export default function VoiceBot() {
   const silenceStartRef = useRef(null);
   const speakingRef = useRef(false);
 
+  const currentAudioRef = useRef(null); // Track currently playing audio
+
   // Tunables
   const SILENCE_MS = 800;               // consider speech ended after 800ms silence
   const RMS_THRESHOLD = 0.01;           // tweak for your mic/room
@@ -27,6 +29,7 @@ export default function VoiceBot() {
 
   useEffect(() => {
     socket.on("server_info", (msg) => setInfo(msg));
+
     socket.on("bot_reply", (msg) => {
       setMessages((prev) => [
         ...prev,
@@ -34,17 +37,28 @@ export default function VoiceBot() {
       ]);
 
       if (msg.bot_audio) {
+        // Stop old audio if playing
+        if (currentAudioRef.current) {
+          currentAudioRef.current.pause();
+          currentAudioRef.current.currentTime = 0;
+        }
+
         const audio = new Audio("data:audio/wav;base64," + msg.bot_audio);
+        currentAudioRef.current = audio;
         audio.play().catch(() => {
-          // Autoplay policy: will play after first user interaction
           console.warn("Autoplay prevented; will play on next user gesture.");
         });
+
+        audio.onended = () => {
+          if (currentAudioRef.current === audio) {
+            currentAudioRef.current = null;
+          }
+        };
       }
     });
 
     socket.on("partial_text", (msg) => {
-      // You can display live captions if you like. Currently sent empty by backend.
-      // console.log("partial:", msg.text);
+      // You can display live captions if you like
     });
 
     return () => {
@@ -68,32 +82,23 @@ export default function VoiceBot() {
       const inBuf = e.inputBuffer.getChannelData(0);
       const rms = computeRMS(inBuf);
 
-      // Resample browser rate (often 44.1/48k) -> 16k Float32
-      const float16k = downsampleFloat(
-        inBuf,
-        audioContextRef.current.sampleRate,
-        TARGET_SAMPLE_RATE
-      );
-      // Convert to PCM16
+      // Resample browser rate -> 16k Float32
+      const float16k = downsampleFloat(inBuf, audioContextRef.current.sampleRate, TARGET_SAMPLE_RATE);
       const pcm16 = floatToPCM16(float16k);
 
       if (rms > RMS_THRESHOLD) {
-        // Voice detected
         speakingRef.current = true;
         silenceStartRef.current = null;
         bufferRef.current.push(pcm16);
       } else if (speakingRef.current) {
-        // Silence during a speech segment
         if (!silenceStartRef.current) {
           silenceStartRef.current = Date.now();
         } else if (Date.now() - silenceStartRef.current > SILENCE_MS) {
-          // End of utterance -> send one merged buffer
+          // End of utterance -> send buffer
           const combined = mergeInt16(bufferRef.current);
-          // socket.emit("voice_chunk", combined.buffer); // send raw ArrayBuffer
           socket.emit("voice_chunk", new Uint8Array(combined.buffer));
-          socket.emit("end_voice");   // tell server to process
+          socket.emit("end_voice");
 
-          // reset
           bufferRef.current = [];
           silenceStartRef.current = null;
           speakingRef.current = false;
@@ -125,14 +130,12 @@ export default function VoiceBot() {
   };
 
   // --- helpers ---
-
   function computeRMS(buf) {
     let sum = 0;
     for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
     return Math.sqrt(sum / buf.length);
   }
 
-  // Downsample Float32 from srcRate -> 16k (simple linear decimator)
   function downsampleFloat(buffer, srcRate, outRate) {
     if (outRate === srcRate) return buffer.slice(0);
 
@@ -144,7 +147,6 @@ export default function VoiceBot() {
     for (let i = 0; i < outLength; i++) {
       const start = Math.floor(i * ratio);
       const end = Math.floor((i + 1) * ratio);
-      // Average to cheap low-pass the decimation
       let sum = 0;
       let count = 0;
       for (let j = start; j < end && j < buffer.length; j++) {
@@ -179,7 +181,7 @@ export default function VoiceBot() {
 
   return (
     <div style={{ padding: 16 }}>
-      <h2>🎙️ Vosk Socket.IO Voice Bot</h2>
+      <h2>🎙️ Socket.IO Voice Bot</h2>
       <div style={{ marginBottom: 12, fontSize: 12, color: "#666" }}>
         {info ? `Connected · server 16kHz` : "Connecting..."}
       </div>
