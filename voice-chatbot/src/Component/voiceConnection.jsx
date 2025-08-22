@@ -22,9 +22,9 @@ export default function VoiceBot() {
   const currentAudioRef = useRef(null); // Track currently playing audio
 
   // Tunables
-  const SILENCE_MS = 800;               // consider speech ended after 800ms silence
+  const SILENCE_MS = 500;               // consider speech ended after 800ms silence
   const RMS_THRESHOLD = 0.01;           // tweak for your mic/room
-  const FRAME_SIZE = 4096;              // script processor buffer size
+  const FRAME_SIZE = 2048;              // script processor buffer size
   const TARGET_SAMPLE_RATE = 16000;
 
   useEffect(() => {
@@ -41,13 +41,18 @@ export default function VoiceBot() {
         if (currentAudioRef.current) {
           currentAudioRef.current.pause();
           currentAudioRef.current.currentTime = 0;
+          currentAudioRef.current = null;
         }
 
         const audio = new Audio("data:audio/wav;base64," + msg.bot_audio);
         currentAudioRef.current = audio;
-        audio.play().catch(() => {
-          console.warn("Autoplay prevented; will play on next user gesture.");
-        });
+
+        // Add 1s gap before playing new audio
+        setTimeout(() => {
+          audio.play().catch(() => {
+            console.warn("Autoplay prevented; will play on next user gesture.");
+          });
+        }, 1000); // 1000 ms = 1 second gap
 
         audio.onended = () => {
           if (currentAudioRef.current === audio) {
@@ -56,6 +61,7 @@ export default function VoiceBot() {
         };
       }
     });
+
 
     socket.on("partial_text", (msg) => {
       // You can display live captions if you like
