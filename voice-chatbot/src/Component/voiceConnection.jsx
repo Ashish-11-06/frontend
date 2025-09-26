@@ -1,70 +1,63 @@
 import React, { useEffect, useRef, useState } from "react";
 import { io } from "socket.io-client";
 
-// Force websocket so binary arrives as bytes
-const socket = io("http://localhost:8001", {
-  transports: ["websocket"],
-});
+const socket = io("http://localhost:8001", { transports: ["websocket"] });
 
 export default function VoiceBot() {
   const [isRecording, setIsRecording] = useState(false);
   const [messages, setMessages] = useState([]);
   const [info, setInfo] = useState(null);
+  const [liveCaption, setLiveCaption] = useState("");
 
   const audioContextRef = useRef(null);
   const sourceRef = useRef(null);
   const processorRef = useRef(null);
 
-  const bufferRef = useRef([]);         // Int16 chunks (downsampled 16k)
+  const bufferRef = useRef([]);
   const silenceStartRef = useRef(null);
   const speakingRef = useRef(false);
-
-  const currentAudioRef = useRef(null); // Track currently playing audio
+  const currentAudioRef = useRef(null);
 
   // Tunables
-  const SILENCE_MS = 500;               // consider speech ended after 800ms silence
-  const RMS_THRESHOLD = 0.01;           // tweak for your mic/room
-  const FRAME_SIZE = 2048;              // script processor buffer size
+  const SILENCE_MS = 400; // speech ends faster
+  const RMS_THRESHOLD = 0.008; // lower = more sensitive
+  const FRAME_SIZE = 2048;
   const TARGET_SAMPLE_RATE = 16000;
 
   useEffect(() => {
     socket.on("server_info", (msg) => setInfo(msg));
 
     socket.on("bot_reply", (msg) => {
-      setMessages((prev) => [
-        ...prev,
-        { from: "bot", text: msg.bot_text },
-      ]);
+      setMessages((prev) => [...prev, { from: "bot", text: msg.bot_text }]);
 
-      if (msg.bot_audio) {
-        // Stop old audio if playing
+    if (msg.bot_audio) {
+      // If STT marked as valid → interrupt
+      if (msg.interrupt) {
         if (currentAudioRef.current) {
           currentAudioRef.current.pause();
           currentAudioRef.current.currentTime = 0;
           currentAudioRef.current = null;
         }
-
-        const audio = new Audio("data:audio/wav;base64," + msg.bot_audio);
-        currentAudioRef.current = audio;
-
-        // Add 1s gap before playing new audio
-        setTimeout(() => {
-          audio.play().catch(() => {
-            console.warn("Autoplay prevented; will play on next user gesture.");
-          });
-        }, 1000); // 1000 ms = 1 second gap
-
-        audio.onended = () => {
-          if (currentAudioRef.current === audio) {
-            currentAudioRef.current = null;
-          }
-        };
       }
-    });
+
+      const audio = new Audio("data:audio/wav;base64," + msg.bot_audio);
+      currentAudioRef.current = audio;
+
+      audio.play().catch(() => {
+        console.warn("Autoplay prevented");
+      });
+
+      audio.onended = () => {
+        if (currentAudioRef.current === audio) {
+          currentAudioRef.current = null;
+        }
+      };
+    }
+  });
 
 
     socket.on("partial_text", (msg) => {
-      // You can display live captions if you like
+      setLiveCaption(msg.text);
     });
 
     return () => {
@@ -76,10 +69,8 @@ export default function VoiceBot() {
 
   const startRecording = async () => {
     if (isRecording) return;
-
     const AC = window.AudioContext || window.webkitAudioContext;
     audioContextRef.current = new AC();
-
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     sourceRef.current = audioContextRef.current.createMediaStreamSource(stream);
 
@@ -88,7 +79,6 @@ export default function VoiceBot() {
       const inBuf = e.inputBuffer.getChannelData(0);
       const rms = computeRMS(inBuf);
 
-      // Resample browser rate -> 16k Float32
       const float16k = downsampleFloat(inBuf, audioContextRef.current.sampleRate, TARGET_SAMPLE_RATE);
       const pcm16 = floatToPCM16(float16k);
 
@@ -96,11 +86,14 @@ export default function VoiceBot() {
         speakingRef.current = true;
         silenceStartRef.current = null;
         bufferRef.current.push(pcm16);
+
+        if (currentAudioRef.current) {
+          currentAudioRef.current.pause();
+          currentAudioRef.current = null;
+        }
       } else if (speakingRef.current) {
-        if (!silenceStartRef.current) {
-          silenceStartRef.current = Date.now();
-        } else if (Date.now() - silenceStartRef.current > SILENCE_MS) {
-          // End of utterance -> send buffer
+        if (!silenceStartRef.current) silenceStartRef.current = Date.now();
+        else if (Date.now() - silenceStartRef.current > SILENCE_MS) {
           const combined = mergeInt16(bufferRef.current);
           socket.emit("voice_chunk", new Uint8Array(combined.buffer));
           socket.emit("end_voice");
@@ -121,21 +114,18 @@ export default function VoiceBot() {
   const stopRecording = () => {
     if (!isRecording) return;
     try {
-      processorRef.current && processorRef.current.disconnect();
-      sourceRef.current && sourceRef.current.disconnect();
-      if (audioContextRef.current && audioContextRef.current.state !== "closed") {
-        audioContextRef.current.close();
-      }
-      const tracks = sourceRef.current?.mediaStream?.getTracks?.() || [];
-      tracks.forEach((t) => t.stop());
-    } catch { }
+      processorRef.current?.disconnect();
+      sourceRef.current?.disconnect();
+      audioContextRef.current?.close();
+      sourceRef.current?.mediaStream?.getTracks?.().forEach((t) => t.stop());
+    } catch {}
     bufferRef.current = [];
     silenceStartRef.current = null;
     speakingRef.current = false;
     setIsRecording(false);
   };
 
-  // --- helpers ---
+  // Helpers
   function computeRMS(buf) {
     let sum = 0;
     for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
@@ -144,23 +134,15 @@ export default function VoiceBot() {
 
   function downsampleFloat(buffer, srcRate, outRate) {
     if (outRate === srcRate) return buffer.slice(0);
-
     const ratio = srcRate / outRate;
     const outLength = Math.floor(buffer.length / ratio);
     const out = new Float32Array(outLength);
-
-    let pos = 0;
     for (let i = 0; i < outLength; i++) {
       const start = Math.floor(i * ratio);
       const end = Math.floor((i + 1) * ratio);
       let sum = 0;
-      let count = 0;
-      for (let j = start; j < end && j < buffer.length; j++) {
-        sum += buffer[j];
-        count++;
-      }
-      out[i] = count > 0 ? sum / count : buffer[start] || 0;
-      pos += ratio;
+      for (let j = start; j < end && j < buffer.length; j++) sum += buffer[j];
+      out[i] = sum / (end - start || 1);
     }
     return out;
   }
@@ -187,9 +169,9 @@ export default function VoiceBot() {
 
   return (
     <div style={{ padding: 16 }}>
-      <h2>🎙️ Socket.IO Voice Bot</h2>
-      <div style={{ marginBottom: 12, fontSize: 12, color: "#666" }}>
-        {info ? `Connected · server 16kHz` : "Connecting..."}
+      <h2>🎙️ Voice Bot (Fast)</h2>
+      <div style={{ fontSize: 12, color: "#666" }}>
+        {info ? "✅ Connected" : "Connecting..."}
       </div>
 
       <button
@@ -201,10 +183,17 @@ export default function VoiceBot() {
           borderRadius: 8,
           border: "none",
           cursor: "pointer",
+          marginTop: 12,
         }}
       >
         {isRecording ? "⏹ Stop" : "🎤 Start"}
       </button>
+
+      {liveCaption && (
+        <div style={{ marginTop: 10, fontStyle: "italic", color: "#555" }}>
+          {liveCaption}
+        </div>
+      )}
 
       <div
         style={{
